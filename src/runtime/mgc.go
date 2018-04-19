@@ -199,7 +199,7 @@ func gcinit() {
 
 func readgogc() int32 {
 	p := gogetenv("GOGC")
-	if p == "off" {
+	if p == "off" || p == "rc" {
 		return -1
 	}
 	if n, ok := atoi32(p); ok {

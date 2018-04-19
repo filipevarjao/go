@@ -8,7 +8,6 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/src"
-	"strings"
 )
 
 // needwb returns whether we need write barrier for store op v.
@@ -18,7 +17,7 @@ func needwb(v *Value) bool {
 	if !ok {
 		v.Fatalf("store aux is not a type: %s", v.LongString())
 	}
-	if !t.HasHeapPointer() {
+	if !t.HasPointer() {
 		return false
 	}
 	if IsStackAddr(v.Args[0]) {
@@ -32,7 +31,7 @@ func needwb(v *Value) bool {
 // and runtime calls, like
 //
 // if writeBarrier.enabled {
-//   gcWriteBarrier(ptr, val)	// Not a regular Go call
+//   writebarrierptr(ptr, val)
 // } else {
 //   *ptr = val
 // }
@@ -44,8 +43,8 @@ func writebarrier(f *Func) {
 		return
 	}
 
-	var sb, sp, wbaddr, const0 *Value
-	var typedmemmove, typedmemclr, gcWriteBarrier *obj.LSym
+	var sb, sp, wbaddr *Value//, const0 *Value
+	var writebarrierptr, typedmemmove, typedmemclr *obj.LSym
 	var stores, after []*Value
 	var sset *sparseSet
 	var storeNumber []int32
@@ -53,7 +52,7 @@ func writebarrier(f *Func) {
 	for _, b := range f.Blocks { // range loop is safe since the blocks we added contain no stores to expand
 		// first, identify all the stores that need to insert a write barrier.
 		// mark them with WB ops temporarily. record presence of WB ops.
-		nWBops := 0 // count of temporarily created WB ops remaining to be rewritten in the current block
+		hasStore := false
 		for _, v := range b.Values {
 			switch v.Op {
 			case OpStore, OpMove, OpZero:
@@ -66,11 +65,11 @@ func writebarrier(f *Func) {
 					case OpZero:
 						v.Op = OpZeroWB
 					}
-					nWBops++
+					hasStore = true
 				}
 			}
 		}
-		if nWBops == 0 {
+		if !hasStore {
 			continue
 		}
 
@@ -95,13 +94,13 @@ func writebarrier(f *Func) {
 			if sp == nil {
 				sp = f.Entry.NewValue0(initpos, OpSP, f.Config.Types.Uintptr)
 			}
-			wbsym := f.fe.Syslook("writeBarrier")
+			wbsym := &ExternSymbol{Sym: f.fe.Syslook("writeBarrier")}
 			wbaddr = f.Entry.NewValue1A(initpos, OpAddr, f.Config.Types.UInt32Ptr, wbsym, sb)
-			gcWriteBarrier = f.fe.Syslook("gcWriteBarrier")
+			writebarrierptr = f.fe.Syslook("writebarrierptr")
 			typedmemmove = f.fe.Syslook("typedmemmove")
 			typedmemclr = f.fe.Syslook("typedmemclr")
-			const0 = f.ConstInt32(f.Config.Types.UInt32, 0)
-
+//			const0 = f.ConstInt32(initpos, f.Config.Types.UInt32, 0)
+// here
 			// allocate auxiliary data structures for computing store order
 			sset = f.newSparseSet(f.NumValues())
 			defer f.retSparseSet(sset)
@@ -163,23 +162,15 @@ func writebarrier(f *Func) {
 		// set up control flow for write barrier test
 		// load word, test word, avoiding partial register write from load byte.
 		cfgtypes := &f.Config.Types
-		flag := b.NewValue2(pos, OpLoad, cfgtypes.UInt32, wbaddr, mem)
-		flag = b.NewValue2(pos, OpNeq32, cfgtypes.Bool, flag, const0)
+//		flag := b.NewValue2(pos, OpLoad, cfgtypes.UInt32, wbaddr, mem)
+//		flag = b.NewValue2(pos, OpNeq32, cfgtypes.Bool, flag, const0)
+		flag := f.ConstBool(pos, cfgtypes.Bool, true)
 		b.Kind = BlockIf
 		b.SetControl(flag)
 		b.Likely = BranchUnlikely
 		b.Succs = b.Succs[:0]
 		b.AddEdgeTo(bThen)
 		b.AddEdgeTo(bElse)
-		// TODO: For OpStoreWB and the buffered write barrier,
-		// we could move the write out of the write barrier,
-		// which would lead to fewer branches. We could do
-		// something similar to OpZeroWB, since the runtime
-		// could provide just the barrier half and then we
-		// could unconditionally do an OpZero (which could
-		// also generate better zeroing code). OpMoveWB is
-		// trickier and would require changing how
-		// cgoCheckMemmove works.
 		bThen.AddEdgeTo(bEnd)
 		bElse.AddEdgeTo(bEnd)
 
@@ -192,21 +183,19 @@ func writebarrier(f *Func) {
 			pos := w.Pos
 
 			var fn *obj.LSym
-			var typ *obj.LSym
+			var typ *ExternSymbol
 			var val *Value
 			switch w.Op {
 			case OpStoreWB:
+				fn = writebarrierptr
 				val = w.Args[1]
-				nWBops--
 			case OpMoveWB:
 				fn = typedmemmove
 				val = w.Args[1]
-				typ = w.Aux.(*types.Type).Symbol()
-				nWBops--
+				typ = &ExternSymbol{Sym: w.Aux.(*types.Type).Symbol()}
 			case OpZeroWB:
 				fn = typedmemclr
-				typ = w.Aux.(*types.Type).Symbol()
-				nWBops--
+				typ = &ExternSymbol{Sym: w.Aux.(*types.Type).Symbol()}
 			case OpVarDef, OpVarLive, OpVarKill:
 			}
 
@@ -214,13 +203,7 @@ func writebarrier(f *Func) {
 			switch w.Op {
 			case OpStoreWB, OpMoveWB, OpZeroWB:
 				volatile := w.Op == OpMoveWB && isVolatile(val)
-				if w.Op == OpStoreWB {
-					memThen = bThen.NewValue3A(pos, OpWB, types.TypeMem, gcWriteBarrier, ptr, val, memThen)
-				} else {
-					memThen = wbcall(pos, bThen, fn, typ, ptr, val, memThen, sp, sb, volatile)
-				}
-				// Note that we set up a writebarrier function call.
-				f.fe.SetWBPos(pos)
+				memThen = wbcall(pos, bThen, fn, typ, ptr, val, memThen, sp, sb, volatile)
 			case OpVarDef, OpVarLive, OpVarKill:
 				memThen = bThen.NewValue1A(pos, w.Op, types.TypeMem, w.Aux, memThen)
 			}
@@ -237,6 +220,16 @@ func writebarrier(f *Func) {
 				memElse.Aux = w.Aux
 			case OpVarDef, OpVarLive, OpVarKill:
 				memElse = bElse.NewValue1A(pos, w.Op, types.TypeMem, w.Aux, memElse)
+			}
+
+			if fn != nil {
+				// Note that we set up a writebarrier function call.
+				if !f.WBPos.IsKnown() {
+					f.WBPos = pos
+				}
+				if f.fe.Debug_wb() {
+					f.Warnl(pos, "write barrier")
+				}
 			}
 		}
 
@@ -269,15 +262,20 @@ func writebarrier(f *Func) {
 		}
 
 		// if we have more stores in this block, do this block again
-		if nWBops > 0 {
-			goto again
+		// check from end to beginning, to avoid quadratic behavior; issue 13554
+		// TODO: track the final value to avoid any looping here at all
+		for i := len(b.Values) - 1; i >= 0; i-- {
+			switch b.Values[i].Op {
+			case OpStoreWB, OpMoveWB, OpZeroWB:
+				goto again
+			}
 		}
 	}
 }
 
 // wbcall emits write barrier runtime call in b, returns memory.
 // if valIsVolatile, it moves val into temp space before making the call.
-func wbcall(pos src.XPos, b *Block, fn, typ *obj.LSym, ptr, val, mem, sp, sb *Value, valIsVolatile bool) *Value {
+func wbcall(pos src.XPos, b *Block, fn *obj.LSym, typ *ExternSymbol, ptr, val, mem, sp, sb *Value, valIsVolatile bool) *Value {
 	config := b.Func.Config
 
 	var tmp GCNode
@@ -287,8 +285,9 @@ func wbcall(pos src.XPos, b *Block, fn, typ *obj.LSym, ptr, val, mem, sp, sb *Va
 		// value we're trying to move.
 		t := val.Type.ElemType()
 		tmp = b.Func.fe.Auto(val.Pos, t)
+		aux := &AutoSymbol{Node: tmp}
 		mem = b.NewValue1A(pos, OpVarDef, types.TypeMem, tmp, mem)
-		tmpaddr := b.NewValue1A(pos, OpAddr, t.PtrTo(), tmp, sp)
+		tmpaddr := b.NewValue1A(pos, OpAddr, t.PtrTo(), aux, sp)
 		siz := t.Size()
 		mem = b.NewValue3I(pos, OpMove, types.TypeMem, siz, tmpaddr, val, mem)
 		mem.Aux = t
@@ -345,39 +344,6 @@ func IsStackAddr(v *Value) bool {
 		return true
 	case OpAddr:
 		return v.Args[0].Op == OpSP
-	}
-	return false
-}
-
-// IsSanitizerSafeAddr reports whether v is known to be an address
-// that doesn't need instrumentation.
-func IsSanitizerSafeAddr(v *Value) bool {
-	for v.Op == OpOffPtr || v.Op == OpAddPtr || v.Op == OpPtrIndex || v.Op == OpCopy {
-		v = v.Args[0]
-	}
-	switch v.Op {
-	case OpSP:
-		// Stack addresses are always safe.
-		return true
-	case OpITab, OpStringPtr, OpGetClosurePtr:
-		// Itabs, string data, and closure fields are
-		// read-only once initialized.
-		return true
-	case OpAddr:
-		switch v.Args[0].Op {
-		case OpSP:
-			return true
-		case OpSB:
-			sym := v.Aux.(*obj.LSym)
-			// TODO(mdempsky): Find a cleaner way to
-			// detect this. It would be nice if we could
-			// test sym.Type==objabi.SRODATA, but we don't
-			// initialize sym.Type until after function
-			// compilation.
-			if strings.HasPrefix(sym.Name, `"".statictmp_`) {
-				return true
-			}
-		}
 	}
 	return false
 }
