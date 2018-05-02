@@ -50,43 +50,24 @@ func tf(n uintptr) uint8 {
 	return *(*uint8)(unsafe.Pointer(n))
 }
 
-func checkp(p uintptr) (x, cc, rgb uintptr, span *mspan, sw bool) {
-	sw = false
-	if inheap(p) {
-		span = spanOf(p)
-		if span.elemsize != 0 {
-			idx := span.objIndex(p)
-			x    = idx*span.elemsize+span.base()
-			cc   = x - uintptr(1)
-			rgb  = x - uintptr(2)
-			color := tf(rgb)
-			if color == uint8(111) || color == uint8(100) || color == uint8(10) {
-				if *(*uint8)(unsafe.Pointer(cc)) > 0 {
-					sw = true
-					return
-				}
-			}
-		}
-	}
-	return
-}
-
 func scanstatusanalyser(span *mspan) {
-	for idx := span.objIndex(span.base()); idx < span.nelems; idx++ {
-		p  := idx*span.elemsize + span.base()
-		if tf(p - 1) == uint8(1) && tf(p - 2) == uint8(111) {
-			markred(p)
-			if tf(p - 2) == uint8(100) && tf(p - 1) > 0 {
-				scangreen(p)
-			}
-			if tf(p - 2) == uint8(100) {
-				collect(p)
-			}
-			if span.freelist != 0 {
-				return
-			}
-		}
-	}
+        for idx := span.objIndex(span.base()); idx < span.nelems; idx++ {
+                p  := idx*span.elemsize + span.base()
+                cc := tf(p - 1)
+                rgb:= tf(p - 2)
+                if cc == uint8(1) && rgb == uint8(111) {
+                        markred(p)
+                }
+                if rgb == uint8(100) && cc > 0 {
+                        scangreen(p)
+                }
+                if rgb == uint8(100) {
+                        collect(p)
+                }
+                if span.freelist != 0 {
+                        return
+                }
+        }
 }
 
 func collect(s uintptr) {
@@ -220,4 +201,19 @@ func markred(obj uintptr) {
 			hbits = hbits.next()
 		}
 	}
+}
+
+func checkp(p uintptr) (x, cc, rgb uintptr, span *mspan, sw bool) {
+        sw = false
+        if inheap(p) {
+                span = spanOf(p)
+                idx := span.objIndex(p)
+                if idx <= span.nelems {
+                        x    = idx*span.elemsize+span.base()
+                        cc   = x - uintptr(1)
+                        rgb  = x - uintptr(2)
+                        sw = true
+                }
+        }
+        return
 }
