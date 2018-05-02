@@ -14,9 +14,12 @@ func incDec(src uintptr, dst uintptr) {
 			x     := uintptr(idx)*span.elemsize+span.base()
 			p     := (x + span.elemsize) - uintptr(1)
 			lastp := uint8((span.limit-span.base())/span.elemsize)
-			if tf(p) >= 1 && tf(p) <= lastp {
+			if tf(p) > 0 && tf(p) <= lastp {
 				s := tf(p) + uint8(1)
 				memmove(unsafe.Pointer(p), noescape(unsafe.Pointer(&s)), 1)
+			} else {
+				*(*uint8)(unsafe.Pointer(p)) = uint8(2)
+				*(*uint8)(unsafe.Pointer(p-1)) = uint8(10)
 			}
 		}
 		span = spanOf(dst)
@@ -26,7 +29,7 @@ func incDec(src uintptr, dst uintptr) {
 			p     := (x + span.elemsize) - uintptr(1)
 			lastp := uint8((span.limit-span.base())/span.elemsize)
 			ref   := *(*uint8)(unsafe.Pointer(p))
-			if ref >= 1 && ref <= lastp {
+			if ref > 0 && ref <= lastp {
 				s := ref - uint8(1)
 				if s >= 1 {
 					memmove(unsafe.Pointer(p), noescape(unsafe.Pointer(&s)), 1)
@@ -41,6 +44,9 @@ func incDec(src uintptr, dst uintptr) {
 					}
 					span.freelist = idx
 				}
+			} else {
+				*(*uint8)(unsafe.Pointer(p)) = uint8(1)
+				*(*uint8)(unsafe.Pointer(p-1)) = uint8(111)
 			}
 		}
 	}
@@ -51,23 +57,23 @@ func tf(n uintptr) uint8 {
 }
 
 func scanstatusanalyser(span *mspan) {
-        for idx := span.objIndex(span.base()); idx < span.nelems; idx++ {
-                p  := idx*span.elemsize + span.base()
-                cc := tf(p - 1)
-                rgb:= tf(p - 2)
-                if cc == uint8(1) && rgb == uint8(111) {
-                        markred(p)
-                }
-                if rgb == uint8(100) && cc > 0 {
-                        scangreen(p)
-                }
-                if rgb == uint8(100) {
-                        collect(p)
-                }
-                if span.freelist != 0 {
-                        return
-                }
-        }
+	for idx := span.objIndex(span.base()); idx < span.nelems; idx++ {
+		p  := idx*span.elemsize + span.base()
+		cc := tf(p - 1)
+		rgb:= tf(p - 2)
+		if cc == uint8(1) && rgb == uint8(111) {
+			markred(p)
+		}
+		if rgb == uint8(100) && cc > 0 {
+			scangreen(p)
+		}
+		if rgb == uint8(100) {
+			collect(p)
+		}
+		if span.freelist != 0 {
+			return
+		}
+	}
 }
 
 func collect(s uintptr) {
@@ -158,10 +164,24 @@ func scangreen(s uintptr) {
 	}
 }
 
+func checkp(p uintptr) (x, cc, rgb uintptr, span *mspan, sw bool) {
+	sw = false
+	if inheap(p) {
+		span = spanOf(p)
+		idx := span.objIndex(p)
+		if idx <= span.nelems {
+			x    = idx*span.elemsize+span.base()
+			cc   = x - uintptr(1)
+			rgb  = x - uintptr(2)
+			sw = true
+		}
+	}
+	return
+}
+
 func markred(obj uintptr) {
 // Red       100
 // B -> White 111
-
 	x, _, rgb, span, sw := checkp(obj)
 	if sw == true && tf(rgb) != uint8(100) {
 		*(*uint8)(unsafe.Pointer(x-2)) = uint8(100)
@@ -190,7 +210,7 @@ func markred(obj uintptr) {
 				next, _, _, _ := heapBitsForObject(b, x, i)
 				_, nextcc, nextrgb, _, nextsw := checkp(next)
 				if nextsw == true {
-					if tf(nextrgb) != uint8(100) && tf(nextcc) > 0 {
+					if tf(nextrgb) != uint8(100) {
 						markred(next)
 					}
 					if tf(nextcc) > 0 && tf(nextrgb) != uint8(111) {
@@ -201,19 +221,4 @@ func markred(obj uintptr) {
 			hbits = hbits.next()
 		}
 	}
-}
-
-func checkp(p uintptr) (x, cc, rgb uintptr, span *mspan, sw bool) {
-        sw = false
-        if inheap(p) {
-                span = spanOf(p)
-                idx := span.objIndex(p)
-                if idx <= span.nelems {
-                        x    = idx*span.elemsize+span.base()
-                        cc   = x - uintptr(1)
-                        rgb  = x - uintptr(2)
-                        sw = true
-                }
-        }
-        return
 }
