@@ -4,6 +4,8 @@ import "unsafe"
 import "runtime/internal/sys"
 
 var startcc uint8 = 1
+// var EnlapsedNs int32  = 0   //cumulative nanoseconds in CD
+// var NumberRF   uintptr = 0  //number of Cyclic Detection performed
 
 //go:nosplit
 func incDec(src uintptr, dst uintptr) {
@@ -35,19 +37,25 @@ func incDec(src uintptr, dst uintptr) {
 					memmove(unsafe.Pointer(p), noescape(unsafe.Pointer(&s)), 1)
 					if s == 1 {
 						*(*uint8)(unsafe.Pointer(p-1)) = uint8(111)
+						if span.startanalyser > idx {
+							span.startanalyser = idx
+						}
 					}
 				} else if s == 0 {
 					if span.freelist != 0 {
-						memmove(unsafe.Pointer(p-uintptr(1)), noescape(unsafe.Pointer(&span.freelist)), 2)
+							memmove(unsafe.Pointer(p-uintptr(1)), noescape(unsafe.Pointer(&span.freelist)), 2)
 					} else {
-						memmove(unsafe.Pointer(p-uintptr(1)), noescape(unsafe.Pointer(&s)), 2)
+							memmove(unsafe.Pointer(p-uintptr(1)), noescape(unsafe.Pointer(&s)), 2)
 					}
 					span.freelist = idx
 				}
-			} else {
+			} else { 
 				*(*uint8)(unsafe.Pointer(p)) = uint8(1)
 				*(*uint8)(unsafe.Pointer(p-1)) = uint8(111)
-			}
+				if span.startanalyser > idx {
+					span.startanalyser = idx
+				}
+			} 
 		}
 	}
 }
@@ -57,23 +65,27 @@ func tf(n uintptr) uint8 {
 }
 
 func scanstatusanalyser(span *mspan) {
-	for idx := span.objIndex(span.base()); idx < span.nelems; idx++ {
+	// _, nsec, _ := time_now()
+	for idx := span.startanalyser; idx < span.nelems; idx++ {
 		p  := idx*span.elemsize + span.base()
 		cc := tf(p - 1)
 		rgb:= tf(p - 2)
 		if cc == uint8(1) && rgb == uint8(111) {
 			markred(p)
-		}
-		if rgb == uint8(100) && cc > 0 {
-			scangreen(p)
-		}
-		if rgb == uint8(100) {
-			collect(p)
-		}
-		if span.freelist != 0 {
-			return
+			if rgb == uint8(100) && cc > 0 {
+				scangreen(p)
+			}
+			if rgb == uint8(100) {
+				collect(p)
+			}
+			if span.freelist != 0 {
+				span.startanalyser = idx
+				return
+			}
 		}
 	}
+	// _, elapsed_nsec, _ := time_now()
+	// EnlapsedNs += (elapsed_nsec - nsec)
 }
 
 func collect(s uintptr) {

@@ -760,6 +760,7 @@ func (h heapBits) initSpan(s *mspan) {
 	s.freeindex = 0
 	s.allocCache = ^uint64(0) // all 1s indicating all free.
 	s.nelems = n
+	s.startanalyser = n
 	s.allocBits = nil
 	s.gcmarkBits = nil
 	s.gcmarkBits = newMarkBits(s.nelems)

@@ -213,6 +213,7 @@ type mSpanList struct {
 //go:notinheap
 type mspan struct {
 	freelist uintptr
+	startanalyser uintptr
 	next *mspan     // next span in list, or nil if none
 	prev *mspan     // previous span in list, or nil if none
 	list *mSpanList // For debugging. TODO: Remove.

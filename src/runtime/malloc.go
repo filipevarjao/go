@@ -580,6 +580,7 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 // Small objects are allocated from the per-P cache's free lists.
 // Large objects (> 32 kB) are allocated straight from the heap.
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	osize := size
 	if gcphase == _GCmarktermination {
 		throw("mallocgc called with gcphase == _GCmarktermination")
 	}
@@ -588,7 +589,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		return unsafe.Pointer(&zerobase)
 	}
 	if environ() != nil && readgogc() == -1 {
-		size += 2
+		size += 1
 	}
 
 	if debug.sbrk != 0 {
@@ -596,7 +597,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		if typ != nil {
 			align = uintptr(typ.align)
 		}
-		return persistentalloc(size, align, &memstats.other_sys)
+		return persistentalloc(osize, align, &memstats.other_sys)
 	}
 
 	// assistG is the G to charge for this allocation, or nil if
@@ -610,7 +611,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		}
 		// Charge the allocation against the G. We'll account
 		// for internal fragmentation at the end of mallocgc.
-		assistG.gcAssistBytes -= int64(size)
+		assistG.gcAssistBytes -= int64(osize)
 
 		if assistG.gcAssistBytes < 0 {
 			// This G is in debt. Assist the GC to correct
@@ -631,13 +632,13 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	mp.mallocing = 1
 
 	shouldhelpgc := false
-	dataSize := size
+	dataSize := osize
 	c := gomcache()
 	var x unsafe.Pointer
 	var span *mspan
 	noscan := typ == nil || typ.kind&kindNoPointers != 0
-	if size <= maxSmallSize {
-		if noscan && size < maxTinySize {
+	if osize <= maxSmallSize {
+		if noscan && osize < maxTinySize {
 			// Tiny allocator.
 			//
 			// Tiny allocator combines several tiny allocation requests
@@ -669,17 +670,17 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// reduces heap size by ~20%.
 			off := c.tinyoffset
 			// Align tiny pointer for required (conservative) alignment.
-			if size&7 == 0 {
+			if osize&7 == 0 {
 				off = round(off, 8)
-			} else if size&3 == 0 {
+			} else if osize&3 == 0 {
 				off = round(off, 4)
-			} else if size&1 == 0 {
+			} else if osize&1 == 0 {
 				off = round(off, 2)
 			}
-			if off+size <= maxTinySize && c.tiny != 0 {
+			if off+osize <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
 				x = unsafe.Pointer(c.tiny + off)
-				c.tinyoffset = off + size
+				c.tinyoffset = off + osize
 				c.local_tinyallocs++
 				mp.mallocing = 0
 				releasem(mp)
@@ -691,7 +692,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			v := nextFreeFast(span)
 			if v == 0 {
 				if environ() != nil && readgogc() == -1 && span.elemsize > 0 {
-					if span.freelist == 0 {
+					if span.freelist == 0 && span.startanalyser != span.nelems {
 						scanstatusanalyser(span)
 					}
 					if span.freelist != 0 {
@@ -706,14 +707,18 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 						if needzero && span.needzero != 0 {
 							memclrNoHeapPointers(unsafe.Pointer(p), span.elemsize)
 						}
-					} else {
-						v, _, shouldhelpgc = c.nextFree(tinySpanClass)
 					}
-				} else {
+				}
+				if v == 0 {
 					v, _, shouldhelpgc = c.nextFree(tinySpanClass)
 				}
 			}
 			x = unsafe.Pointer(v)
+			if environ() != nil && readgogc() == -1 {
+				mp.mallocing = 0
+				releasem(mp)
+				return x
+			}
 			(*[2]uint64)(x)[0] = 0
 			(*[2]uint64)(x)[1] = 0
 			// See if we need to replace the existing tiny block with the new one
@@ -736,7 +741,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			v := nextFreeFast(span)
 			if v == 0 {
 				if environ() != nil && readgogc() == -1 && span.elemsize > 0 {
-					if span.freelist == 0 {
+					if span.freelist == 0 && span.startanalyser != span.nelems {
 						scanstatusanalyser(span)
 					}
 					if span.freelist != 0 {
@@ -748,10 +753,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 						} else {
 							span.freelist = 0
 						}
-					} else {
-						v, span, shouldhelpgc = c.nextFree(spc)
 					}
-				} else {
+				}
+				if v == 0 {
 					v, span, shouldhelpgc = c.nextFree(spc)
 				}
 			}
@@ -759,28 +763,34 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			if needzero && span.needzero != 0 {
 				memclrNoHeapPointers(unsafe.Pointer(v), size)
 			}
+			if environ() != nil && readgogc() == -1 {
+				mp.mallocing = 0
+				releasem(mp)
+				return x
+			}
 		}
 	} else {
-		shouldhelpgc = true
-		systemstack(func() {
-			span = largeAlloc(size, needzero, noscan)
-		})
-		span.freeindex = 1
-		span.allocCount = 1
-		x = unsafe.Pointer(span.base())
-		size = span.elemsize
+			shouldhelpgc = true
+			systemstack(func() {
+				span = largeAlloc(size, needzero, noscan)
+			})
+			span.freeindex = 1
+			span.allocCount = 1
+			x = unsafe.Pointer(span.base())
+			size = span.elemsize
 	}
 	if environ() != nil && readgogc() == -1 && span.elemsize > 0 {
-		if rc == false {
-			rc = true
+			if rc == false {
+				rc = true
+			}
+			p  := (uintptr(x) + span.elemsize) - uintptr(1)
+			memmove(unsafe.Pointer(p), unsafe.Pointer(&startcc), 1)
+			*(*uint8)(unsafe.Pointer(p-1)) = uint8(10)
 
-		}
-		p  := (uintptr(x) + span.elemsize) - uintptr(1)
-		memmove(unsafe.Pointer(p), unsafe.Pointer(&startcc), 1)
-		*(*uint8)(unsafe.Pointer(p-1)) = uint8(10)
+			mp.mallocing = 0
+			releasem(mp)
+			return x
 	}
-
-
 	var scanSize uintptr
 	if !noscan {
 		// If allocating a defer+arg block, now that we've picked a malloc size
@@ -858,7 +868,6 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			gcStart(gcBackgroundMode, t)
 		}
 	}
-
 	return x
 }
 
